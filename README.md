@@ -1,4 +1,4 @@
-# Eco-Mamba
+# Eco-Mamba: Ecology-Aware Adaptive Mamba for Animal Action Recognition
 
 Official implementation of **Eco-Mamba: Ecology-Aware Adaptive Mamba for Animal Action Recognition**. Eco-Mamba treats animal behaviour recognition as ecology-aware multi-label inference: it allocates a fixed frame budget to behavioural events, interprets events with scene and relation context, and produces ethogram-consistent action predictions.
 
