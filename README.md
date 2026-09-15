@@ -4,11 +4,11 @@ Official implementation of **Eco-Mamba: Ecology-Aware Adaptive Mamba for Animal 
 
 ## Overview
 
-![Figure 1: Motivation for Eco-Mamba](Figure1.png)
+![Figure 1: Motivation for Eco-Mamba](Figure1.jpg)
 
 **Figure 1 — Ecological motivation.** Animal-action evidence is often temporally sparse, depends on scene and inter-animal relations, and follows an ethogram hierarchy. Eco-Mamba explicitly models these three properties instead of treating every frame and action label independently.
 
-![Figure 2: Eco-Mamba architecture](Figure2.png)
+![Figure 2: Eco-Mamba architecture](Figure2.jpg)
 
 **Figure 2 — Eco-Mamba architecture.** EES first selects representative event frames under a fixed budget. The Dual-Context Encoder extracts event and scene representations, RFG injects scene-relation context into event tokens, and HED jointly predicts behaviour groups and fine-grained actions.
 
