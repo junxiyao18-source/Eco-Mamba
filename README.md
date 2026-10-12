@@ -65,14 +65,20 @@ The paper setting uses 12 EES-selected frames, a 16-layer decoder, 100 frozen-ba
 python train.py \
   --dataset animalkingdom \
   --data-root Animal_Kingdom \
-  --videomamba-version m \
+  --clip-model-path openai/clip-vit-base-patch16 \
+  --pretrained-root pretrained \
+  --videomamba-version t \
   --num-frames 12 \
   --sampling-strategy ees \
   --decoder-layers 16 \
   --freeze-backbone-epochs 100 \
   --finetune-backbone-epochs 150 \
   --batch-size 8 \
+  --num-workers 2 \
+  --test-every 5 \
   --group-loss-weight 1.0 \
   --hier-loss-weight 0.2 \
-  --save-path checkpoints/eco_mamba_m12_ees.pth
+  --gpu 0 \
+  --seed 1 \
+  --save-path checkpoints/eco_mamba_t12_ees.pth
 ```
