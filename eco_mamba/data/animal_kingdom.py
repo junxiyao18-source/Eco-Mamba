@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image, ImageFile
 from torch.utils.data import Dataset
 
-from .ecological_event_sampler import EcologicalEventSampler
+from .ecological_event_sampler import EcologicalEventSampler, build_relation_descriptor
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -41,6 +41,7 @@ class AnimalKingdomDataset(Dataset):
         self.sampling_strategy = sampling_strategy
         self.frame_sampler = EcologicalEventSampler(strategy=sampling_strategy)
         self._frame_index_cache = {}
+        self._relation_descriptor_cache = {}
         self.video_list, self.file_list = self._parse_annotations()
 
     def _parse_annotations(self):
@@ -105,11 +106,17 @@ class AnimalKingdomDataset(Dataset):
                 image = fallback_image.copy()
             images.append(image)
 
+        if self.sampling_strategy == "random":
+            relation_descriptor = build_relation_descriptor(images)
+        else:
+            if index not in self._relation_descriptor_cache:
+                self._relation_descriptor_cache[index] = build_relation_descriptor(images)
+            relation_descriptor = self._relation_descriptor_cache[index].copy()
         clip = self.transform(images)
         clip = clip.view((self.num_frames, -1) + clip.size()[-2:])
         label = np.zeros(self.num_classes, dtype=np.float32)
         label[record.labels] = 1.0
-        return clip, label
+        return clip, label, relation_descriptor
 
     def __len__(self) -> int:
         return len(self.video_list)

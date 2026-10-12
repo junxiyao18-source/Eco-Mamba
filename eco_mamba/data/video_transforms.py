@@ -43,12 +43,13 @@ class GroupCenterCrop(object):
 class GroupRandomHorizontalFlip(object):
     """Randomly horizontally flips the given PIL.Image with a probability of 0.5
     """
-    def __init__(self, is_sth=False):
+    def __init__(self, is_sth=False, p=0.5):
         self.is_sth = is_sth
+        self.p = p
 
     def __call__(self, img_group, is_sth=False):
         v = random.random()
-        if not self.is_sth and v < 0.5:
+        if not self.is_sth and v < self.p:
             
             ret = [img.transpose(Image.FLIP_LEFT_RIGHT) for img in img_group]
             return ret

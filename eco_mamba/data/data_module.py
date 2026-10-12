@@ -4,7 +4,7 @@ import random
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader
 from torchvision.transforms import Compose
 
 from .animal_kingdom import AnimalKingdomDataset
@@ -41,7 +41,7 @@ class AnimalKingdomDataModule:
 
     def train_transform(self):
         mean, std = [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]
-        return Compose([GroupMultiScaleCrop(224, [1, .875, .75, .66]), GroupRandomHorizontalFlip(True), GroupRandomColorJitter(p=.8, brightness=.4, contrast=.4, saturation=.2, hue=.1), GroupRandomGrayscale(p=.2), GroupGaussianBlur(p=0.), GroupSolarization(p=0.), Stack(roll=False), ToTorchFormatTensor(div=True), GroupNormalize(mean, std)])
+        return Compose([GroupMultiScaleCrop(224, [1, .875, .75, .66]), GroupRandomHorizontalFlip(), GroupRandomColorJitter(p=.8, brightness=.4, contrast=.4, saturation=.2, hue=.1), GroupRandomGrayscale(p=.2), GroupGaussianBlur(p=0.), GroupSolarization(p=0.), Stack(roll=False), ToTorchFormatTensor(div=True), GroupNormalize(mean, std)])
 
     @staticmethod
     def evaluation_transform():
@@ -53,7 +53,8 @@ class AnimalKingdomDataModule:
 
     def train_loader(self):
         dataset = self._dataset("train", self.train_transform())
-        return DataLoader(dataset, batch_size=self.batch_size, sampler=RandomSampler(dataset, num_samples=2500), num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True,
+                          num_workers=self.num_workers, pin_memory=True)
 
     def validation_loader(self):
         dataset = self._dataset("val", self.evaluation_transform())

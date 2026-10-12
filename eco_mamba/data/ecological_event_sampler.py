@@ -7,6 +7,82 @@ import numpy as np
 from PIL import Image
 
 
+def _connected_component_features(mask: np.ndarray) -> tuple[float, float]:
+    """Return 4-connected component count and normalized centroid dispersion."""
+    visited = np.zeros_like(mask, dtype=bool)
+    centroids = []
+    for y, x in zip(*np.where(mask)):
+        if visited[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        visited[y, x] = True
+        pixels = []
+        while stack:
+            py, px = stack.pop()
+            pixels.append((py, px))
+            for ny, nx in ((py - 1, px), (py + 1, px), (py, px - 1), (py, px + 1)):
+                if (0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx] and not visited[ny, nx]):
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+        centroids.append(np.mean(pixels, axis=0))
+    dispersion = 0.0
+    if len(centroids) > 1:
+        dispersion = float(np.std(np.asarray(centroids), axis=0).mean() / max(mask.shape))
+    return float(len(centroids)), dispersion
+
+
+def build_relation_descriptor(frames) -> np.ndarray:
+    """Build Eq. (9)-(10)'s six-dimensional descriptor from selected frames.
+
+    The accepted input is an iterable of RGB PIL images or HWC numpy arrays.
+    Every frame is evaluated at 64x64 before temporal averaging.
+    """
+    rgb_frames = []
+    for frame in frames:
+        if isinstance(frame, Image.Image):
+            image = frame.convert("RGB").resize((64, 64), Image.Resampling.BILINEAR)
+            array = np.asarray(image, dtype=np.float32) / 255.0
+        else:
+            array = np.asarray(frame, dtype=np.float32)
+            if array.max(initial=0.0) > 1.0:
+                array = array / 255.0
+            image = Image.fromarray(np.uint8(np.clip(array, 0, 1) * 255), mode="RGB")
+            array = np.asarray(
+                image.resize((64, 64), Image.Resampling.BILINEAR), dtype=np.float32
+            ) / 255.0
+        rgb_frames.append(array)
+    if not rgb_frames:
+        raise ValueError("At least one frame is required for a relation descriptor")
+
+    rgb = np.stack(rgb_frames)
+    gray = rgb.mean(axis=3)
+    if len(gray) == 1:
+        differences = np.zeros_like(gray)
+    else:
+        adjacent = np.abs(np.diff(gray, axis=0))
+        differences = np.concatenate([adjacent[:1], adjacent], axis=0)
+
+    frame_features = []
+    for frame, difference in zip(gray, differences):
+        foreground = difference > (difference.mean() + difference.std())
+        component_count, centroid_dispersion = _connected_component_features(foreground)
+        area_ratio = float(foreground.mean())
+        difference_intensity = float(difference.mean())
+        brightness = float(frame.mean())
+        laplacian = (
+            4 * frame[1:-1, 1:-1]
+            - frame[:-2, 1:-1] - frame[2:, 1:-1]
+            - frame[1:-1, :-2] - frame[1:-1, 2:]
+        )
+        inverse_sharpness = float(1.0 / (1.0 + laplacian.var()))
+        frame_features.append([
+            component_count, area_ratio, centroid_dispersion,
+            difference_intensity, brightness, inverse_sharpness,
+        ])
+    return np.asarray(frame_features, dtype=np.float32).mean(axis=0)
+
+
 class EcologicalEventSampler:
     """
     Sampler that implements multiple strategies for selecting frames from video:
@@ -253,22 +329,18 @@ class EcologicalEventSampler:
             scout_indices[peak_positions], num_frames
         )
 
-        # The two paper anchors are reserved before trimming, so an overfull
-        # event pool can never remove them.
+        # Merge peaks, neighborhoods, and anchors, then retain the highest
+        # scoring candidates exactly as described in Section 4.2.3.
         anchors = self._global_anchor_indices(num_frames, budget_k)
-        anchor_set = set(anchors.tolist())
-        event_slots = max(0, budget_k - len(anchors))
         frame_scores = np.interp(
             np.arange(num_frames), scout_indices, combined_scores
         )
-        ranked_events = sorted(
-            (int(index) for index in event_candidates
-             if int(index) not in anchor_set),
+        candidates = np.unique(np.concatenate([event_candidates, anchors]))
+        ranked_candidates = sorted(
+            (int(index) for index in candidates),
             key=lambda index: (-frame_scores[index], index),
         )
-        selected_indices = np.array(
-            anchors.tolist() + ranked_events[:event_slots], dtype=int
-        )
+        selected_indices = np.asarray(ranked_candidates[:budget_k], dtype=int)
         return np.sort(selected_indices).astype(int)
     
     def _scout_preview_indices(self, num_frames: int) -> np.ndarray:
@@ -323,9 +395,9 @@ class EcologicalEventSampler:
         features = []
         for img in images:
             # Simple histogram-based feature
-            hist_r = np.histogram(img[:, :, 0], bins=8)[0]
-            hist_g = np.histogram(img[:, :, 1], bins=8)[0]
-            hist_b = np.histogram(img[:, :, 2], bins=8)[0]
+            hist_r = np.histogram(img[:, :, 0], bins=8, range=(0, 1))[0]
+            hist_g = np.histogram(img[:, :, 1], bins=8, range=(0, 1))[0]
+            hist_b = np.histogram(img[:, :, 2], bins=8, range=(0, 1))[0]
             feat = np.concatenate([hist_r, hist_g, hist_b])
             feat = feat / (np.sum(feat) + 1e-8)
             features.append(feat)
