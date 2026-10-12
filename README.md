@@ -1,14 +1,14 @@
-# Eco-Mamba: Ecology-Aware Adaptive Mamba for Animal Action Recognition
+# Eco-Mamba: Recognizing Animal Behavior through the Lens of Behavioral Ecology
 
  Eco-Mamba treats animal behaviour recognition as ecology-aware multi-label inference: it allocates a fixed frame budget to behavioural events, interprets events with scene and relation context, and produces ethogram-consistent action predictions.
 
 ## Overview
 
-![Figure 1: Motivation for Eco-Mamba](Figure1.jpg)
+![Figure 1: Motivation for Eco-Mamba](Figure1.png)
 
 **Figure 1 — Ecological motivation.** Animal-action evidence is often temporally sparse, depends on scene and inter-animal relations, and follows an ethogram hierarchy. Eco-Mamba explicitly models these three properties instead of treating every frame and action label independently.
 
-![Figure 2: Eco-Mamba architecture](Figure2.jpg)
+![Figure 2: Eco-Mamba architecture](Figure2.png)
 
 **Figure 2 — Eco-Mamba architecture.** EES first selects representative event frames under a fixed budget. The Dual-Context Encoder extracts event and scene representations, RFG injects scene-relation context into event tokens, and HED jointly predicts behaviour groups and fine-grained actions.
 
@@ -17,6 +17,12 @@ The implementation includes:
 - **Ecological Event Sampler (EES):** motion transition, novelty, relation activation, and observation uncertainty select a fixed number of event frames.
 - **Dual-Context Encoder + Relational Fusion Gate (RFG):** VideoMamba event tokens are conditioned on frozen CLIP scene features and lightweight relation descriptors.
 - **Hierarchical Ethogram Decoder (HED):** jointly predicts 16 Animal Kingdom behaviour groups and 140 fine-grained actions, with a consistency loss.
+
+### Qualitative EES sampling
+
+![Figure 4: Qualitative comparison of uniform sampling and EES](Figure4.png)
+
+**Figure 4 — Uniform sampling vs. EES under the same 12-frame budget.** The curves show the four normalized scoring cues and the resulting ecological event score for two chasing clips. Blue hollow circles and blue-bordered frames denote uniform samples; orange stars and orange-bordered frames denote EES selections. In the late-pursuit example, EES reallocates frames from the long standoff/approach period toward charge and pursuit. In the close-pursuit example, EES densely covers the brief interval in which the pursuer closes the distance. An `E` label in a Uniform row marks a frame also selected by EES.
 
 ## Environment
 
@@ -70,4 +76,3 @@ python train.py \
   --hier-loss-weight 0.2 \
   --save-path checkpoints/eco_mamba_m12_ees.pth
 ```
-
