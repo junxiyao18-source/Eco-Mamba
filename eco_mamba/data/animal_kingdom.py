@@ -38,7 +38,9 @@ class AnimalKingdomDataset(Dataset):
         self.transform = transform
         self.num_classes = len(action_to_id)
         self.annotation_path = os.path.join(root, "action_recognition", "annotation", f"{split}_light.csv")
+        self.sampling_strategy = sampling_strategy
         self.frame_sampler = EcologicalEventSampler(strategy=sampling_strategy)
+        self._frame_index_cache = {}
         self.video_list, self.file_list = self._parse_annotations()
 
     def _parse_annotations(self):
@@ -59,11 +61,37 @@ class AnimalKingdomDataset(Dataset):
     def _load_image(directory: str, image_name: str) -> Image.Image:
         return Image.open(os.path.join(directory, image_name)).convert("RGB")
 
+    def get_frame_indices(self, index: int) -> np.ndarray:
+        """Return the exact raw-frame indices consumed by ``__getitem__``."""
+        if self.sampling_strategy != "random" and index in self._frame_index_cache:
+            return self._frame_index_cache[index].copy()
+
+        record = self.video_list[index]
+        image_names = self.file_list[index]
+        if not image_names:
+            raise RuntimeError(f"Video at dataset index {index} contains no frames")
+        frame_paths = [
+            os.path.join(record.path, image_name) for image_name in image_names
+        ]
+        indices = self.frame_sampler.sample_indices(
+            num_frames=len(image_names),
+            budget_k=self.num_frames,
+            frame_paths=frame_paths,
+        )
+        if len(indices) != self.num_frames:
+            raise RuntimeError(
+                f"Sampler '{self.sampling_strategy}' returned {len(indices)} "
+                f"frames; expected {self.num_frames}"
+            )
+
+        if self.sampling_strategy != "random":
+            self._frame_index_cache[index] = indices.copy()
+        return indices
+
     def __getitem__(self, index: int):
         record = self.video_list[index]
         image_names = self.file_list[index]
-        frame_paths = [os.path.join(record.path, image_name) for image_name in image_names]
-        indices = self.frame_sampler.sample_indices(record.num_frames, self.num_frames, frame_paths)
+        indices = self.get_frame_indices(index)
 
         images, fallback_image = [], None
         for frame_index in indices:

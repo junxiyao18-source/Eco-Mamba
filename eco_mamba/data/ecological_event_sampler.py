@@ -50,6 +50,13 @@ class EcologicalEventSampler:
         """
         if num_frames <= 0:
             raise ValueError("A video must contain at least one frame.")
+        if budget_k <= 0:
+            raise ValueError("The frame budget must be positive.")
+        if frame_paths is not None and len(frame_paths) != num_frames:
+            raise ValueError(
+                "frame_paths must contain one path per video frame: "
+                f"{len(frame_paths)} != {num_frames}"
+            )
         if self.strategy == "uniform":
             indices = self._uniform_indices(num_frames, budget_k)
         elif self.strategy == "random":
@@ -71,9 +78,40 @@ class EcologicalEventSampler:
                 indices = self._ees_indices(num_frames, budget_k, frame_paths)
         else:
             indices = self._uniform_indices(num_frames, budget_k)
-        # The transform expects exactly K frames. Repeating an index is necessary
-        # only for clips shorter than the requested temporal budget.
-        return np.resize(np.sort(indices).astype(int), budget_k)
+        return self._ensure_budget(indices, num_frames, budget_k)
+
+    @staticmethod
+    def _ensure_budget(
+        indices: np.ndarray,
+        num_frames: int,
+        budget_k: int,
+    ) -> np.ndarray:
+        """Return exactly K valid indices in chronological order."""
+        indices = np.asarray(indices, dtype=int).reshape(-1)
+        indices = np.unique(indices[(indices >= 0) & (indices < num_frames)])
+
+        # A clip shorter than K necessarily repeats frames. Linspace distributes
+        # those repetitions over the complete temporal axis and remains sorted.
+        if budget_k > num_frames:
+            return np.linspace(0, num_frames - 1, budget_k, dtype=int)
+
+        if len(indices) < budget_k:
+            selected = set(indices.tolist())
+            fill_order = np.concatenate([
+                np.linspace(0, num_frames - 1, budget_k, dtype=int),
+                np.arange(num_frames),
+            ])
+            for candidate in fill_order:
+                selected.add(int(candidate))
+                if len(selected) == budget_k:
+                    break
+            indices = np.fromiter(selected, dtype=int)
+
+        if len(indices) > budget_k:
+            indices = indices[
+                np.linspace(0, len(indices) - 1, budget_k, dtype=int)
+            ]
+        return np.sort(indices).astype(int)
     
     def _uniform_indices(self, num_frames: int, budget_k: int) -> np.ndarray:
         """Baseline: evenly spaced frames"""
@@ -208,30 +246,29 @@ class EcologicalEventSampler:
         combined_scores = (combined_scores - combined_scores.min()) / \
                          (combined_scores.max() - combined_scores.min() + 1e-8)
         
-        # Retain four event peaks and their radius-one temporal neighborhoods.
-        peak_count = min(4, len(scout_indices))
-        peak_positions = np.argsort(combined_scores)[-peak_count:]
-        selected_indices = self._expand_with_window(scout_indices[peak_positions], num_frames)
-        
-        # Add anchor frames
-        selected_indices = self._add_anchor_frames(
-            selected_indices, num_frames, budget_k
+        # Section 4.2.3: retain four local event peaks and expand every peak by
+        # the configured temporal radius (w=1 in the paper).
+        peak_positions = self._find_local_peak_positions(combined_scores, count=4)
+        event_candidates = self._expand_with_window(
+            scout_indices[peak_positions], num_frames
         )
-        
-        # Preserve event evidence when candidates exceed the budget; fill remaining
-        # slots uniformly to maintain global temporal coverage.
-        selected_indices = np.unique(selected_indices)
-        if len(selected_indices) > budget_k:
-            scores_by_index = {int(index): score for index, score in zip(scout_indices, combined_scores)}
-            selected_indices = np.array(sorted(selected_indices, key=lambda index: scores_by_index.get(int(index), 0.0), reverse=True)[:budget_k])
-        if len(selected_indices) < budget_k:
-            selected = list(selected_indices)
-            for candidate in np.linspace(0, num_frames - 1, budget_k, dtype=int):
-                if candidate not in selected:
-                    selected.append(candidate)
-                if len(selected) == budget_k:
-                    break
-            selected_indices = np.array(selected)
+
+        # The two paper anchors are reserved before trimming, so an overfull
+        # event pool can never remove them.
+        anchors = self._global_anchor_indices(num_frames, budget_k)
+        anchor_set = set(anchors.tolist())
+        event_slots = max(0, budget_k - len(anchors))
+        frame_scores = np.interp(
+            np.arange(num_frames), scout_indices, combined_scores
+        )
+        ranked_events = sorted(
+            (int(index) for index in event_candidates
+             if int(index) not in anchor_set),
+            key=lambda index: (-frame_scores[index], index),
+        )
+        selected_indices = np.array(
+            anchors.tolist() + ranked_events[:event_slots], dtype=int
+        )
         return np.sort(selected_indices).astype(int)
     
     def _scout_preview_indices(self, num_frames: int) -> np.ndarray:
@@ -248,8 +285,8 @@ class EcologicalEventSampler:
             for idx in scout_indices:
                 if idx < len(frame_paths):
                     img = Image.open(frame_paths[idx]).convert('RGB')
-                    # Resize for efficiency
-                    img = img.resize((56, 56), Image.Resampling.BILINEAR)
+                    # Section 4.2.2 defines 64 x 64 scout frames.
+                    img = img.resize((64, 64), Image.Resampling.BILINEAR)
                     images.append(np.array(img, dtype=np.float32) / 255.0)
             return np.array(images) if images else None
         except Exception as e:
@@ -359,6 +396,29 @@ class EcologicalEventSampler:
         contrast = (contrast - contrast.min()) / (contrast.max() - contrast.min() + 1e-8)
         uncertainty = (1 - sharpness) + (1 - contrast) + 2 * np.abs(brightness - .5)
         return (uncertainty - uncertainty.min()) / (uncertainty.max() - uncertainty.min() + 1e-8)
+
+    @staticmethod
+    def _find_local_peak_positions(scores: np.ndarray, count: int = 4) -> np.ndarray:
+        """Select the highest local maxima, with global fallback for short curves."""
+        scores = np.asarray(scores)
+        if count <= 0 or len(scores) == 0:
+            return np.array([], dtype=int)
+
+        local_positions = []
+        for position, score in enumerate(scores):
+            left = scores[position - 1] if position > 0 else -np.inf
+            right = scores[position + 1] if position + 1 < len(scores) else -np.inf
+            if score >= left and score >= right:
+                local_positions.append(position)
+
+        ranked = sorted(local_positions, key=lambda index: (-scores[index], index))
+        for position in np.argsort(-scores, kind="stable"):
+            position = int(position)
+            if position not in ranked:
+                ranked.append(position)
+            if len(ranked) >= min(count, len(scores)):
+                break
+        return np.array(ranked[:min(count, len(scores))], dtype=int)
     
     def _select_event_peaks(
         self,
@@ -394,12 +454,17 @@ class EcologicalEventSampler:
         budget_k: int
     ) -> np.ndarray:
         """Add the two global anchors specified for Eco-Mamba (1/3 and 2/3)."""
-        anchors = set(selected_indices.tolist())
-        
-        if num_frames > 1:
-            anchors.add(round((num_frames - 1) / 3))
-            anchors.add(round(2 * (num_frames - 1) / 3))
-        
-        # Convert back to array and trim to budget
-        result = np.array(sorted(anchors), dtype=int)
-        return result[:budget_k]
+        anchors = set(np.asarray(selected_indices, dtype=int).tolist())
+        anchors.update(self._global_anchor_indices(num_frames, budget_k).tolist())
+        return np.array(sorted(anchors), dtype=int)
+
+    @staticmethod
+    def _global_anchor_indices(num_frames: int, budget_k: int) -> np.ndarray:
+        """Return paper anchors at normalized temporal positions 1/3 and 2/3."""
+        if num_frames <= 0 or budget_k <= 0:
+            return np.array([], dtype=int)
+        anchors = np.array([
+            round((num_frames - 1) / 3),
+            round(2 * (num_frames - 1) / 3),
+        ], dtype=int)
+        return np.unique(anchors)[:budget_k]
