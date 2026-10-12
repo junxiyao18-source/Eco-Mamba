@@ -18,6 +18,8 @@ from eco_mamba.models.video_mamba_backbone import (
     configure_pretrained_weights, videomamba_middle, videomamba_small, videomamba_tiny,
 )
 from eco_mamba.models.hierarchical_ethogram_loss import HierarchicalEthogramLoss
+from eco_mamba.models.clip_scene_encoder import encode_with_interpolated_positions
+from eco_mamba.data.ecological_event_sampler import build_relation_descriptor
 from eco_mamba.data.ethogram import AK_ACTION_TO_GROUP_ID, AK_GROUP_NAMES, NUM_GROUPS
 from eco_mamba.metrics import (
     build_group_targets,
@@ -79,24 +81,6 @@ def create_block(
     )
     block.layer_idx = layer_idx
     return block
-
-
-class PositionalEncoding(nn.Module):
-    """Positional encoding for sequence"""
-    
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 2000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        position = torch.arange(max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(1, max_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe, persistent=False)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
 
 
 class ActionQueryClassifier(nn.Module):
@@ -176,42 +160,40 @@ class EcoMamba(nn.Module):
         
         # ===== Event Stream (High-Resolution) =====
         self.event_projection = nn.Linear(in_features=backbone_dim, out_features=self.embed_dim, bias=False)
-        self.event_position = PositionalEncoding(d_model=self.embed_dim)
         
         # ===== Context Stream (Low-Resolution) =====
         if use_context_branch:
             self.image_model = CLIPVisionModel.from_pretrained(clip_model_path)
-            self.context_proj = nn.Linear(in_features=768, out_features=self.embed_dim, bias=False)
-            
-            # Relation feature projection
-            self.relation_proj = nn.Linear(in_features=6, out_features=self.embed_dim, bias=False)
+            for parameter in self.image_model.parameters():
+                parameter.requires_grad = False
+            clip_dim = self.image_model.config.hidden_size
+            self.context_proj = nn.Linear(clip_dim, self.embed_dim, bias=False)
+            self.context_condition_mlp = nn.Sequential(
+                nn.Linear(self.embed_dim + 6, self.embed_dim),
+                nn.ReLU(),
+                nn.Linear(self.embed_dim, self.embed_dim),
+            )
         else:
             self.image_model = None
             self.context_proj = None
-            self.relation_proj = None
+            self.context_condition_mlp = None
         
         # ===== Fusion Gates =====
         self.relational_fusion_gate = nn.Sequential(
-            nn.Linear(self.embed_dim * 2 + 6, self.embed_dim),
-            nn.ReLU(),
-            nn.Linear(self.embed_dim, 1),
+            nn.Linear(self.embed_dim * 2, self.embed_dim),
             nn.Sigmoid()
         )
         
         # ===== Query Decoder =====
         self.query_embed = nn.Parameter(class_embed)
         if use_context_branch:
-            self.query_context_projection = nn.Linear(
-                in_features=768 + self.embed_dim,
-                out_features=self.embed_dim,
-                bias=False
+            self.query_context_projection = nn.Sequential(
+                nn.Linear(clip_dim + self.embed_dim, self.embed_dim, bias=False),
+                nn.ReLU(),
+                nn.Linear(self.embed_dim, self.embed_dim, bias=False),
             )
         else:
-            self.query_context_projection = nn.Linear(
-                in_features=self.embed_dim,
-                out_features=self.embed_dim,
-                bias=False
-            )
+            self.query_context_projection = nn.Identity()
         
         # ===== Decoder Mamba Layers =====
         self.decoder_blocks = nn.ModuleList([
@@ -221,11 +203,9 @@ class EcoMamba(nn.Module):
             )
             for i in range(decoder_layers)
         ])
+        self.decoder_norm = nn.LayerNorm(self.embed_dim)
         
         # ===== Output Layers =====
-        # Action head: [B, K+C, D] -> [B, C, K]
-        self.decoder_token_count = event_frame_budget + self.num_classes
-        self.query_token_projection = nn.Linear(in_features=self.decoder_token_count, out_features=self.num_classes, bias=False)
         self.action_classifier = ActionQueryClassifier(self.num_classes, self.embed_dim, bias=True)
         
         # ===== Hierarchical Decoder =====
@@ -241,61 +221,30 @@ class EcoMamba(nn.Module):
             self.group_head = None
             self.group_condition_proj = None
     
-    def _build_relation_features(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Extract relation features from images
-        
-        Args:
-            images: [B, T, C, H, W]
-        
-        Returns:
-            [B, 6] relation features
-        """
-        b, t = images.shape[:2]
-        
-        # Convert to grayscale for analysis
-        gray = torch.mean(images, dim=2)  # [B, T, H, W]
-        
-        # Compute features
-        features = []
-        
-        # 1. Average brightness
-        brightness = gray.mean(dim=(2, 3))  # [B, T]
-        brightness_mean = brightness.mean(dim=1)
-        brightness_var = brightness.var(dim=1)
-        features.append(brightness_mean.unsqueeze(1))
-        features.append(brightness_var.unsqueeze(1))
-        
-        # 2. Motion (frame difference)
-        if t > 1:
-            motion = torch.abs(torch.diff(gray, dim=1))  # [B, T-1, H, W]
-            motion_mean = motion.mean(dim=(2, 3)).mean(dim=1)  # [B]
-            motion_var = motion.mean(dim=(2, 3)).var(dim=1)  # [B]
-            features.append(motion_mean.unsqueeze(1))
-            features.append(motion_var.unsqueeze(1))
-        else:
-            features.append(torch.zeros(b, 1, device=images.device))
-            features.append(torch.zeros(b, 1, device=images.device))
-        
-        # 3. Edge energy (simple Sobel)
-        edge_energy = torch.zeros(b, device=images.device)
-        for bi in range(min(b, 2)):  # Only first 2 samples for efficiency
-            for ti in range(min(t, 4)):
-                img = gray[bi, ti]
-                # Sobel operator
-                gx = torch.abs(img[:-2, 1:-1] - img[2:, 1:-1])
-                gy = torch.abs(img[1:-1, :-2] - img[1:-1, 2:])
-                edge_energy[bi] += (gx + gy).mean()
-        features.append(edge_energy.unsqueeze(1) / max(1, b))
-        
-        # 4. Contrast
-        contrast = gray.std(dim=(2, 3)).mean(dim=1)
-        features.append(contrast.unsqueeze(1))
-        
-        relation_feat = torch.cat(features, dim=1)  # [B, 6]
-        return relation_feat
+    def train(self, mode: bool = True):
+        """Keep the paper's frozen CLIP Scene Stream in evaluation mode."""
+        super().train(mode)
+        if self.image_model is not None:
+            self.image_model.eval()
+        return self
+
+    def _encode_scene_frames(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Run CLIP at 112x112 with bicubic positional-embedding interpolation."""
+        return encode_with_interpolated_positions(self.image_model, pixel_values)
+
+    @staticmethod
+    def _build_relation_features(images: torch.Tensor) -> torch.Tensor:
+        """Fallback Eq. (9)-(10) implementation when the dataset supplies no descriptor."""
+        mean = images.new_tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 1, 3, 1, 1)
+        std = images.new_tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 1, 3, 1, 1)
+        rgb = (images.detach() * std + mean).clamp(0, 1)
+        rgb = rgb.permute(0, 1, 3, 4, 2).cpu().numpy()
+        descriptors = [build_relation_descriptor(video) for video in rgb]
+        return torch.as_tensor(np.stack(descriptors), device=images.device, dtype=images.dtype)
     
-    def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, images: torch.Tensor, relation_features: torch.Tensor | None = None
+    ) -> Dict[str, torch.Tensor]:
         """
         Forward pass
         
@@ -308,9 +257,8 @@ class EcoMamba(nn.Module):
         b, t, c, h, w = images.size()
         
         # ===== Event Stream (Backbone) =====
-        x_event = self.backbone.forward_features(images.reshape(b, c, t, h, w))
+        x_event = self.backbone.forward_features(images.permute(0, 2, 1, 3, 4).contiguous())
         x_event = self.event_projection(F.adaptive_avg_pool1d(x_event.transpose(1, 2), self.event_frame_budget).transpose(1, 2))
-        x_event = self.event_position(x_event)  # [B, K, D]
         
         # ===== Context Stream =====
         if self.use_context_branch and self.image_model is not None:
@@ -319,26 +267,20 @@ class EcoMamba(nn.Module):
                 images.reshape(b * t, c, h, w), size=(self.context_resolution, self.context_resolution),
                 mode="bilinear", align_corners=False,
             )
-            context_feat = self.image_model(scene_images)[1]  # [B*T, 768]
-            context_feat = context_feat.reshape(b, t, -1).mean(dim=1)  # [B, 768]
+            with torch.no_grad():
+                context_feat = self._encode_scene_frames(scene_images)
+            context_feat = context_feat.reshape(b, t, -1).mean(dim=1)
             context_proj = self.context_proj(context_feat)  # [B, D]
-            
-            # Relation features
-            relation_feat = self._build_relation_features(images)  # [B, 6]
-            
-            # Fusion gating
-            context_repeat = context_proj.unsqueeze(1).repeat(1, self.event_frame_budget, 1)  # [B, K, D]
-            relation_proj = self.relation_proj(relation_feat).unsqueeze(1)  # [B, 1, D]
-            
-            gate_input = torch.cat([
-                x_event,
-                context_repeat,
-                relation_feat.unsqueeze(1).expand(b, self.event_frame_budget, 6)
-            ], dim=2)  # [B, K, 2D+6]
-            
-            gate = self.relational_fusion_gate(gate_input)  # [B, K, 1]
-            # RFG: adaptively inject scene and relation conditions into each event token.
-            x_fused = x_event + gate * (context_repeat + relation_proj)
+
+            if relation_features is None:
+                relation_features = self._build_relation_features(images)
+            relation_features = relation_features.to(device=images.device, dtype=x_event.dtype)
+            condition = self.context_condition_mlp(
+                torch.cat([context_proj, relation_features], dim=-1)
+            )
+            condition = condition.unsqueeze(1).expand(-1, self.event_frame_budget, -1)
+            gate = self.relational_fusion_gate(torch.cat([x_event, condition], dim=-1))
+            x_fused = x_event + gate * condition
             
             # Query generation
             query_embed = self.query_context_projection(
@@ -360,11 +302,10 @@ class EcoMamba(nn.Module):
         residual = None
         for layer in self.decoder_blocks:
             x, residual = layer(x, residual)
-        
-        # ===== Action Head =====
-        _, d1, d2 = x.size()
-        x_out = self.query_token_projection(x.reshape(b, d2, d1)).reshape(b, self.num_classes, -1)
-        action_logits = self.action_classifier(x_out)  # [B, C]
+
+        x = self.decoder_norm(x if residual is None else residual + x)
+        decoded_queries = x[:, -self.num_classes:, :]
+        action_logits = self.action_classifier(decoded_queries)
         
         output = {"action_logits": action_logits}
         
@@ -376,7 +317,7 @@ class EcoMamba(nn.Module):
             
             # Group conditioning
             group_cond = self.group_condition_proj(torch.sigmoid(group_logits)).unsqueeze(1)  # [B, 1, D]
-            x_action_cond = x_out + group_cond.repeat(1, self.num_classes, 1)
+            x_action_cond = decoded_queries + group_cond
             action_logits_cond = self.action_classifier(x_action_cond)
             
             output["action_logits"] = action_logits_cond
@@ -505,11 +446,13 @@ class EcoMambaTrainer:
     
     def _get_text_features(self, cl_names):
         text_model = CLIPTextModel.from_pretrained(self.args.clip_model_path)
+        text_model.eval()
         tokenizer = CLIPTokenizer.from_pretrained(self.args.clip_model_path)
         
         prompts = self._get_prompt(cl_names)
         texts = tokenizer(prompts, padding=True, return_tensors="pt")
-        text_class = text_model(**texts).pooler_output.detach()
+        with torch.no_grad():
+            text_class = text_model(**texts).pooler_output
         return text_class
     
     def _log(self, msg: str):
@@ -518,11 +461,11 @@ class EcoMambaTrainer:
         with open(self.log_file, 'a') as f:
             f.write(msg + '\n')
     
-    def _train_batch(self, data, label):
+    def _train_batch(self, data, label, relation_features=None):
         """Train single batch"""
         self.optimizer.zero_grad()
         
-        output = self.model(data)
+        output = self.model(data, relation_features)
         
         if self.use_hierarchical_decoder and self.eco_loss is not None:
             # Build group targets
@@ -556,15 +499,15 @@ class EcoMambaTrainer:
         start_time = time.time()
         
         for batch_idx, batch in enumerate(self.train_loader):
-            if len(batch) == 3:
-                data, label, meta = batch
-            else:
-                data, label = batch
+            data, label = batch[:2]
+            relation_features = batch[2] if len(batch) >= 3 else None
             
             data = data.to(self.gpu_id, non_blocking=True)
             label = label.to(self.gpu_id, non_blocking=True)
+            if relation_features is not None:
+                relation_features = relation_features.to(self.gpu_id, non_blocking=True)
             
-            loss, loss_dict = self._train_batch(data, label)
+            loss, loss_dict = self._train_batch(data, label, relation_features)
             loss_meter.update(loss, data.shape[0])
         
         elapsed_time = time.time() - start_time
@@ -597,14 +540,8 @@ class EcoMambaTrainer:
             model_state = ckpt.get('model', ckpt.get('model_state_dict', ckpt))
         else:
             model_state = ckpt
-        legacy_prefixes = {
-            'linear1.': 'event_projection.', 'pos_encod.': 'event_position.',
-            'context_gate.': 'relational_fusion_gate.', 'linear2.': 'query_context_projection.',
-            'layers.': 'decoder_blocks.', 'linear3.': 'query_token_projection.',
-            'group_linear.': 'action_classifier.',
-        }
         model_state = {
-            next((new + key.removeprefix('module.')[len(old):] for old, new in legacy_prefixes.items() if key.removeprefix('module.').startswith(old)), key.removeprefix('module.')): value
+            key.removeprefix('module.'): value
             for key, value in model_state.items()
         }
         
@@ -691,15 +628,15 @@ class EcoMambaTrainer:
         
         with torch.no_grad():
             for batch in self.test_loader:
-                if len(batch) == 3:
-                    data, label, meta = batch
-                else:
-                    data, label = batch
+                data, label = batch[:2]
+                relation_features = batch[2] if len(batch) >= 3 else None
                 
                 data = data.to(self.gpu_id, non_blocking=True)
                 label = label.to(self.gpu_id, non_blocking=True)
+                if relation_features is not None:
+                    relation_features = relation_features.to(self.gpu_id, non_blocking=True)
                 
-                output = self.model(data)
+                output = self.model(data, relation_features)
                 action_logits = output["action_logits"]
                 
                 all_action_logits.append(action_logits.cpu().numpy())
@@ -714,12 +651,7 @@ class EcoMambaTrainer:
         # Compute metrics
         results = {}
         
-        # Action mAP - use numerically stable sigmoid
-        action_probs = np.where(
-            all_action_logits >= 0,
-            1 / (1 + np.exp(-all_action_logits)),
-            np.exp(all_action_logits) / (1 + np.exp(all_action_logits))
-        )
+        action_probs = torch.sigmoid(torch.from_numpy(all_action_logits)).numpy()
         self.eval_metric.reset()
         # Ensure correct data types for torchmetrics
         # MultilabelAveragePrecision expects preds as float and target as int/long
@@ -735,24 +667,15 @@ class EcoMambaTrainer:
             
             # Group mAP
             group_mAP, _ = compute_group_map(
-                all_action_logits,
+                all_group_logits,
                 all_action_targets,
                 AK_ACTION_TO_GROUP_ID,
                 AK_GROUP_NAMES
             )
             results["group_mAP"] = group_mAP
             
-            # HCR - use numerically stable sigmoid
-            action_probs = np.where(
-                all_action_logits >= 0,
-                1 / (1 + np.exp(-all_action_logits)),
-                np.exp(all_action_logits) / (1 + np.exp(all_action_logits))
-            )
-            group_probs = np.where(
-                all_group_logits >= 0,
-                1 / (1 + np.exp(-all_group_logits)),
-                np.exp(all_group_logits) / (1 + np.exp(all_group_logits))
-            )
+            action_probs = torch.sigmoid(torch.from_numpy(all_action_logits)).numpy()
+            group_probs = torch.sigmoid(torch.from_numpy(all_group_logits)).numpy()
             hcr = hierarchical_consistency_rate(
                 action_probs, group_probs, AK_ACTION_TO_GROUP_ID
             )
