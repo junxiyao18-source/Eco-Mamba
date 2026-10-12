@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument("--data-root", default="Animal_Kingdom", help="Animal Kingdom dataset directory.")
     parser.add_argument("--clip-model-path", default="openai/clip-vit-base-patch16")
     parser.add_argument("--pretrained-root", default="pretrained")
-    parser.add_argument("--videomamba-version", default="m", choices=["t", "s", "m"])
+    parser.add_argument("--videomamba-version", default="t", choices=["t", "s", "m"])
     parser.add_argument("--num-frames", default=12, type=int, help="EES frame budget K.")
     parser.add_argument("--sampling-strategy", default="ees", choices=["uniform", "random", "motion", "relation", "ees"])
     parser.add_argument("--decoder-layers", default=16, type=int)
@@ -52,7 +52,7 @@ def main(args):
     data = AnimalKingdomDataModule(args, args.data_root)
     train_loader, validation_loader = data.train_loader(), data.validation_loader()
     class_list = list(data.action_to_id().keys())
-    metric = MultilabelAveragePrecision(num_labels=len(class_list), average="micro")
+    metric = MultilabelAveragePrecision(num_labels=len(class_list), average="macro")
     trainer = EcoMambaTrainer(train_loader, validation_loader, nn.BCEWithLogitsLoss(), metric,
                               class_list, args.test_every, False, device, args)
     start_epoch = trainer.load_checkpoint(args.checkpoint, map_location=device) if args.checkpoint else 0
